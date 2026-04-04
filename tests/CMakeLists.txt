@@ -1,12 +1,3 @@
-include(FetchContent)
-
-FetchContent_Declare(
-    Catch2
-    GIT_REPOSITORY https://github.com/catchorg/Catch2.git
-    GIT_TAG        v3.8.0
-)
-FetchContent_MakeAvailable(Catch2)
-
 add_executable(barcode_tests
     test_dct.cpp
     test_scanline.cpp
@@ -20,6 +11,6 @@ target_compile_definitions(barcode_tests PRIVATE
     TEST_DATA_DIR="${zxing_testdata_SOURCE_DIR}/core/src/test/resources/blackbox"
 )
 
-list(APPEND CMAKE_MODULE_PATH ${Catch2_SOURCE_DIR}/extras)
+list(APPEND CMAKE_MODULE_PATH ${catch2_SOURCE_DIR}/extras)
 include(Catch)
 catch_discover_tests(barcode_tests)

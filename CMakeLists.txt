@@ -12,26 +12,19 @@ else()
 endif()
 
 include(FetchContent)
-
-# stb - single-header image loading (public domain)
-FetchContent_Declare(
-    stb
-    GIT_REPOSITORY https://github.com/nothings/stb.git
-    GIT_TAG        master
+FetchContent_Declare(cmake-dep
+    GIT_REPOSITORY https://github.com/jorgen/cmake-dep.git
+    GIT_TAG        f61ffba
 )
-FetchContent_MakeAvailable(stb)
+FetchContent_MakeAvailable(cmake-dep)
+list(APPEND CMAKE_MODULE_PATH "${cmake-dep_SOURCE_DIR}/cmake")
+include(CmDepMain)
 
-# zxing (Java) - fetched for barcode test images in core/src/test/resources/blackbox/
-# Contains EAN-13, Code128, UPC-A, etc. test images with expected results
-# SOURCE_SUBDIR points to a data-only dir so CMake won't try to build the Java project
-FetchContent_Declare(
-    zxing_testdata
-    GIT_REPOSITORY https://github.com/zxing/zxing.git
-    GIT_TAG        master
-    GIT_SHALLOW    TRUE
-    SOURCE_SUBDIR  core/src/test/resources
-)
-FetchContent_MakeAvailable(zxing_testdata)
+set(CMDEP_PACKAGES_FILE "${CMAKE_CURRENT_SOURCE_DIR}/CMake/3rdPartyPackages.cmake")
+CmDepFetch()
+
+include(CMake/Build3rdParty.cmake)
+Build3rdParty()
 
 add_subdirectory(src)
 add_subdirectory(app)
