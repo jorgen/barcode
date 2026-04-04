@@ -13,3 +13,13 @@ CmDepFetchPackage(zxing_testdata 3007faa
     https://github.com/zxing/zxing/archive/3007faae3a91e98765305dd00cfd080887c41997.tar.gz
     SHA256=1548b76cda71ee6722ecdade75ae878b1e471f1b7e9e96b6a9b217d45846a31b
 )
+
+CmDepFetchPackage(glfw 3.4
+    https://github.com/glfw/glfw/archive/3.4.tar.gz
+    SHA256=c038d34200234d071fae9345bc455e4a8f2f544ab60150765d7704e08f3dac01
+)
+
+CmDepFetchPackage(imgui 1.91.6
+    https://github.com/ocornut/imgui/archive/v1.91.6.tar.gz
+    SHA256=c5fbc5dcab1d46064001c3b84d7a88812985cde7e0e9ced03f5677bec1ba502a
+)
