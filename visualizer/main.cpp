@@ -51,10 +51,21 @@ struct AppState {
     std::vector<bc::Edge> edges;
     bc::DecodeResult result;
 
+    // Full-image filtered view
+    bc::Image filtered_image;
+    GLuint filtered_texture_id = 0;
+    bool filter_2d = false;
+
     // UI
     bool show_power_spectrum = false;
     bool pipeline_dirty = true;
     char path_buf[512] = {};
+
+    // Region drag state
+    bool dragging_region = false;
+    bool drag_is_move = false;
+    float drag_start_img_x = 0, drag_start_img_y = 0;
+    float drag_orig_region_x = 0, drag_orig_region_y = 0;
 };
 
 // ---------------------------------------------------------------------------
@@ -82,6 +93,76 @@ static void delete_texture(GLuint& tex) {
 }
 
 // ---------------------------------------------------------------------------
+// Build FilterParams from current UI state
+// ---------------------------------------------------------------------------
+static bc::FilterParams build_filter_params(const AppState& s) {
+    bc::FilterParams fp;
+    switch (s.filter_type_idx) {
+        case 1: fp.type = bc::FilterType::LowPass;       fp.cutoff = s.cutoff; break;
+        case 2: fp.type = bc::FilterType::HardThreshold;  fp.threshold = s.threshold; break;
+        case 3: fp.type = bc::FilterType::SoftThreshold;  fp.threshold = s.threshold; break;
+        case 4:
+            fp.type = bc::FilterType::BandPass;
+            fp.band_low = s.band_low;
+            fp.band_high = s.band_high;
+            break;
+        default: break; // filter_type_idx == 0 handled by caller
+    }
+    return fp;
+}
+
+// ---------------------------------------------------------------------------
+// Filter entire image row-by-row (and optionally column-by-column)
+// ---------------------------------------------------------------------------
+static void filter_full_image(AppState& s) {
+    if (!s.image_loaded || s.filter_type_idx == 0) {
+        delete_texture(s.filtered_texture_id);
+        s.filtered_image = {};
+        return;
+    }
+
+    auto fp = build_filter_params(s);
+    int w = s.image.width;
+    int h = s.image.height;
+
+    s.filtered_image.width = w;
+    s.filtered_image.height = h;
+    s.filtered_image.pixels.resize(w * h);
+
+    // Row-by-row filtering
+    for (int y = 0; y < h; ++y) {
+        bc::Scanline row(w);
+        for (int x = 0; x < w; ++x)
+            row[x] = static_cast<float>(s.image.pixels[y * w + x]);
+
+        auto filtered_row = bc::dct_filter(row, fp);
+
+        for (int x = 0; x < w; ++x)
+            s.filtered_image.pixels[y * w + x] =
+                static_cast<uint8_t>(std::clamp(filtered_row[x], 0.0f, 255.0f));
+    }
+
+    // Optional column-by-column filtering (separable 2D DCT)
+    if (s.filter_2d) {
+        for (int x = 0; x < w; ++x) {
+            bc::Scanline col(h);
+            for (int y = 0; y < h; ++y)
+                col[y] = static_cast<float>(s.filtered_image.pixels[y * w + x]);
+
+            auto filtered_col = bc::dct_filter(col, fp);
+
+            for (int y = 0; y < h; ++y)
+                s.filtered_image.pixels[y * w + x] =
+                    static_cast<uint8_t>(std::clamp(filtered_col[y], 0.0f, 255.0f));
+        }
+    }
+
+    // Upload to GL texture
+    delete_texture(s.filtered_texture_id);
+    s.filtered_texture_id = upload_texture(s.filtered_image);
+}
+
+// ---------------------------------------------------------------------------
 // Load image into state
 // ---------------------------------------------------------------------------
 static void load_image_into_state(AppState& s, const std::string& path) {
@@ -91,6 +172,8 @@ static void load_image_into_state(AppState& s, const std::string& path) {
         s.image_loaded = true;
 
         delete_texture(s.texture_id);
+        delete_texture(s.filtered_texture_id);
+        s.filtered_image = {};
         s.texture_id = upload_texture(s.image);
 
         // Default region: full image, horizontal scan
@@ -136,17 +219,9 @@ static void run_pipeline(AppState& s) {
         s.filtered_coeffs = s.dct_coeffs;
         s.filtered = s.averaged;
     } else {
-        bc::FilterParams fp;
-        switch (s.filter_type_idx) {
-            case 1: fp.type = bc::FilterType::LowPass;       fp.cutoff = s.cutoff; break;
-            case 2: fp.type = bc::FilterType::HardThreshold;  fp.threshold = s.threshold; break;
-            case 3: fp.type = bc::FilterType::SoftThreshold;  fp.threshold = s.threshold; break;
-            case 4:
-                fp.type = bc::FilterType::BandPass;
-                fp.band_low = s.band_low;
-                fp.band_high = std::min(s.band_high, static_cast<int>(s.dct_coeffs.size()) - 1);
-                break;
-        }
+        auto fp = build_filter_params(s);
+        if (fp.type == bc::FilterType::BandPass)
+            fp.band_high = std::min(fp.band_high, static_cast<int>(s.dct_coeffs.size()) - 1);
         s.filtered_coeffs = bc::apply_filter(s.dct_coeffs, fp);
         s.filtered = bc::dct_iii(s.filtered_coeffs);
     }
@@ -154,6 +229,9 @@ static void run_pipeline(AppState& s) {
     // Edge detection & decode
     s.edges = bc::detect_edges(s.filtered);
     s.result = bc::decode_scanline(s.filtered);
+
+    // Full-image filtered view
+    filter_full_image(s);
 
     s.pipeline_dirty = false;
 }
@@ -315,6 +393,10 @@ int main(int argc, char* argv[]) {
             if (ImGui::SliderFloat("Spacing", &state.scanline_spacing, 0.5f, 10.0f, "%.1f"))
                 state.pipeline_dirty = true;
             ImGui::PopItemWidth();
+
+            ImGui::SameLine();
+            if (ImGui::Checkbox("2D Filter", &state.filter_2d))
+                state.pipeline_dirty = true;
         }
 
         ImGui::Separator();
@@ -332,7 +414,8 @@ int main(int argc, char* argv[]) {
 
             // Region controls
             bool region_changed = false;
-            ImGui::PushItemWidth(left_w - 15.0f);
+            auto& style = ImGui::GetStyle();
+            ImGui::PushItemWidth(-ImGui::CalcTextSize("Dir X").x - style.ItemInnerSpacing.x);
             region_changed |= ImGui::DragFloat("X", &state.region_x, 1.0f, 0.0f,
                                                 static_cast<float>(state.image.width));
             region_changed |= ImGui::DragFloat("Y", &state.region_y, 1.0f, 0.0f,
@@ -349,44 +432,151 @@ int main(int argc, char* argv[]) {
 
             ImGui::Separator();
 
-            // Display image with overlays
+            // Display images with overlays
             float img_w = static_cast<float>(state.image.width);
             float img_h = static_cast<float>(state.image.height);
-            float display_w = ImGui::GetContentRegionAvail().x;
-            float scale = display_w / img_w;
-            float display_h = img_h * scale;
+            float content_w = ImGui::GetContentRegionAvail().x;
+            bool has_filtered = state.filtered_texture_id != 0;
 
-            ImVec2 cursor = ImGui::GetCursorScreenPos();
-            ImGui::Image(static_cast<ImTextureID>(state.texture_id),
-                         ImVec2(display_w, display_h));
+            // Scale to fill panel width; cap height to avoid overflow
+            float scale = content_w / img_w;
+            float avail_img_h = ImGui::GetContentRegionAvail().y;
+            float max_img_h = has_filtered ? (avail_img_h - 60.0f) * 0.5f : avail_img_h;
+            float display_w = content_w;
+            float display_h = std::min(img_h * scale, std::max(max_img_h, 1.0f));
 
-            // Draw region rect overlay
-            auto* draw_list = ImGui::GetWindowDrawList();
-            ImVec2 r_min(cursor.x + state.region_x * scale,
-                         cursor.y + state.region_y * scale);
-            ImVec2 r_max(cursor.x + (state.region_x + state.region_w) * scale,
-                         cursor.y + (state.region_y + state.region_h) * scale);
-            draw_list->AddRect(r_min, r_max, IM_COL32(255, 255, 0, 200), 0.0f, 0, 2.0f);
+            // Helper lambda to draw region rect + scanline overlays on the last image
+            auto draw_overlays = [&](ImVec2 cursor) {
+                auto* draw_list = ImGui::GetWindowDrawList();
+                ImVec2 r_min(cursor.x + state.region_x * scale,
+                             cursor.y + state.region_y * scale);
+                ImVec2 r_max(cursor.x + (state.region_x + state.region_w) * scale,
+                             cursor.y + (state.region_y + state.region_h) * scale);
+                draw_list->AddRect(r_min, r_max, IM_COL32(255, 255, 0, 200), 0.0f, 0, 2.0f);
 
-            // Draw scanline positions
-            if (!state.raw_scanlines.empty()) {
-                auto dir = bc::Vec2f{state.dir_x, state.dir_y}.normalized();
-                auto perp = dir.perpendicular();
-                float center_offset = (state.num_scanlines - 1) * state.scanline_spacing * 0.5f;
+                if (!state.raw_scanlines.empty()) {
+                    auto dir = bc::Vec2f{state.dir_x, state.dir_y}.normalized();
+                    auto perp = dir.perpendicular();
+                    float center_offset = (state.num_scanlines - 1) * state.scanline_spacing * 0.5f;
 
-                for (int i = 0; i < state.num_scanlines; ++i) {
-                    float offset = i * state.scanline_spacing - center_offset;
-                    float cy = state.region_y + state.region_h * 0.5f + perp.y * offset;
-                    float cx = state.region_x + perp.x * offset;
+                    for (int i = 0; i < state.num_scanlines; ++i) {
+                        float offset = i * state.scanline_spacing - center_offset;
+                        float cy = state.region_y + state.region_h * 0.5f + perp.y * offset;
+                        float cx = state.region_x + perp.x * offset;
 
-                    ImVec2 p0(cursor.x + cx * scale,
-                              cursor.y + cy * scale);
-                    ImVec2 p1(cursor.x + (cx + dir.x * state.region_w) * scale,
-                              cursor.y + (cy + dir.y * state.region_w) * scale);
+                        ImVec2 p0(cursor.x + cx * scale,
+                                  cursor.y + cy * scale);
+                        ImVec2 p1(cursor.x + (cx + dir.x * state.region_w) * scale,
+                                  cursor.y + (cy + dir.y * state.region_w) * scale);
 
-                    ImU32 col = IM_COL32(0, 200, 255, 120);
-                    draw_list->AddLine(p0, p1, col, 1.0f);
+                        ImU32 col = IM_COL32(0, 200, 255, 120);
+                        draw_list->AddLine(p0, p1, col, 1.0f);
+                    }
                 }
+            };
+
+            // Handle click-drag on the original image to move/create region
+            auto handle_image_drag = [&](ImVec2 img_screen_pos) {
+                bool hovered = ImGui::IsItemHovered();
+
+                // Hit-test: "near edge" means inside region but within margin of a border
+                auto near_region_edge = [&](float mx, float my) {
+                    constexpr float margin = 6.0f; // pixels in image coords
+                    bool inside = mx >= state.region_x && mx <= state.region_x + state.region_w &&
+                                  my >= state.region_y && my <= state.region_y + state.region_h;
+                    if (!inside) return false;
+                    float dl = mx - state.region_x;
+                    float dr = (state.region_x + state.region_w) - mx;
+                    float dt = my - state.region_y;
+                    float db = (state.region_y + state.region_h) - my;
+                    return dl < margin || dr < margin || dt < margin || db < margin;
+                };
+
+                // Cursor feedback
+                if (state.dragging_region && state.drag_is_move) {
+                    ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeAll);
+                } else if (hovered) {
+                    ImVec2 mouse = ImGui::GetIO().MousePos;
+                    float mx = (mouse.x - img_screen_pos.x) / scale;
+                    float my = (mouse.y - img_screen_pos.y) / scale;
+                    if (near_region_edge(mx, my))
+                        ImGui::SetMouseCursor(ImGuiMouseCursor_ResizeAll);
+                }
+
+                // Start drag
+                if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+                    ImVec2 mouse = ImGui::GetIO().MousePos;
+                    float mx = (mouse.x - img_screen_pos.x) / scale;
+                    float my = (mouse.y - img_screen_pos.y) / scale;
+                    state.dragging_region = true;
+                    state.drag_start_img_x = mx;
+                    state.drag_start_img_y = my;
+                    if (near_region_edge(mx, my)) {
+                        state.drag_is_move = true;
+                        state.drag_orig_region_x = state.region_x;
+                        state.drag_orig_region_y = state.region_y;
+                    } else {
+                        state.drag_is_move = false;
+                    }
+                }
+
+                // Continue drag (works even if mouse leaves the image)
+                if (state.dragging_region) {
+                    ImVec2 mouse = ImGui::GetIO().MousePos;
+                    float mx = (mouse.x - img_screen_pos.x) / scale;
+                    float my = (mouse.y - img_screen_pos.y) / scale;
+
+                    if (state.drag_is_move) {
+                        float dx = mx - state.drag_start_img_x;
+                        float dy = my - state.drag_start_img_y;
+                        state.region_x = std::clamp(state.drag_orig_region_x + dx,
+                                                     0.0f, std::max(img_w - state.region_w, 0.0f));
+                        state.region_y = std::clamp(state.drag_orig_region_y + dy,
+                                                     0.0f, std::max(img_h - state.region_h, 0.0f));
+                    } else {
+                        float x0 = std::clamp(std::min(state.drag_start_img_x, mx), 0.0f, img_w);
+                        float y0 = std::clamp(std::min(state.drag_start_img_y, my), 0.0f, img_h);
+                        float x1 = std::clamp(std::max(state.drag_start_img_x, mx), 0.0f, img_w);
+                        float y1 = std::clamp(std::max(state.drag_start_img_y, my), 0.0f, img_h);
+                        state.region_x = x0;
+                        state.region_y = y0;
+                        state.region_w = std::max(x1 - x0, 1.0f);
+                        state.region_h = std::max(y1 - y0, 1.0f);
+                    }
+                    state.pipeline_dirty = true;
+
+                    if (ImGui::IsMouseReleased(ImGuiMouseButton_Left))
+                        state.dragging_region = false;
+                }
+            };
+
+            if (has_filtered) {
+                ImGui::Text("Original");
+                ImVec2 cursor = ImGui::GetCursorScreenPos();
+                ImGui::Image(static_cast<ImTextureID>(state.texture_id),
+                             ImVec2(display_w, display_h));
+                // Overlay invisible button for robust click-drag input
+                ImGui::SetCursorScreenPos(cursor);
+                ImGui::InvisibleButton("##orig_interact", ImVec2(display_w, display_h));
+                handle_image_drag(cursor);
+                draw_overlays(cursor);
+
+                ImGui::Spacing();
+
+                ImGui::Text("Filtered%s", state.filter_2d ? " (2D)" : "");
+                cursor = ImGui::GetCursorScreenPos();
+                ImGui::Image(static_cast<ImTextureID>(state.filtered_texture_id),
+                             ImVec2(display_w, display_h));
+                draw_overlays(cursor);
+            } else {
+                ImVec2 cursor = ImGui::GetCursorScreenPos();
+                ImGui::Image(static_cast<ImTextureID>(state.texture_id),
+                             ImVec2(display_w, display_h));
+                // Overlay invisible button for robust click-drag input
+                ImGui::SetCursorScreenPos(cursor);
+                ImGui::InvisibleButton("##orig_interact", ImVec2(display_w, display_h));
+                handle_image_drag(cursor);
+                draw_overlays(cursor);
             }
         } else {
             ImGui::TextWrapped("No image loaded. Enter a path above and click Load.");
@@ -398,7 +588,9 @@ int main(int argc, char* argv[]) {
         // Right panel: plots
         ImGui::BeginChild("PlotsPanel", ImVec2(right_w, avail_h), ImGuiChildFlags_Borders);
         if (state.image_loaded && !state.averaged.empty()) {
-            float plot_h = (avail_h - 120.0f) / 4.0f; // 4 plots
+            // Non-plot overhead: 4 text labels (~80px) + 3 spacings (~24px) + 1 checkbox (~20px)
+            float plots_avail = ImGui::GetContentRegionAvail().y;
+            float plot_h = (plots_avail - 124.0f) / 4.0f;
 
             // 1. Raw scanlines (overlaid)
             ImGui::Text("Raw Scanlines (%d)", static_cast<int>(state.raw_scanlines.size()));
@@ -514,6 +706,7 @@ int main(int argc, char* argv[]) {
 
     // Cleanup
     delete_texture(state.texture_id);
+    delete_texture(state.filtered_texture_id);
     ImGui_ImplOpenGL3_Shutdown();
     ImGui_ImplGlfw_Shutdown();
     ImGui::DestroyContext();
