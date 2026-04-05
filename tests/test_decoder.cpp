@@ -4,6 +4,9 @@
 #include "decoder.h"
 #include "image.h"
 
+#include <algorithm>
+#include <random>
+
 using namespace bc;
 using Catch::Matchers::WithinAbs;
 
@@ -92,6 +95,77 @@ TEST_CASE("Decode various EAN-13 codes", "[decoder][ean13]") {
         REQUIRE(result.success);
         REQUIRE(result.text == code);
     }
+}
+
+TEST_CASE("Gradient edge detection on square wave", "[decoder][edges][gradient]") {
+    Scanline signal = {0, 0, 0, 255, 255, 255, 0, 0, 0, 255, 255, 255, 0, 0, 0};
+
+    auto edges = detect_edges_gradient(signal, 50.0f);
+
+    // Should find 4 edges (same as threshold method)
+    REQUIRE(edges.size() == 4);
+
+    // First edge: rising
+    REQUIRE(edges[0].rising == true);
+    REQUIRE(edges[0].position > 2.0f);
+    REQUIRE(edges[0].position < 3.5f);
+
+    // Second edge: falling
+    REQUIRE(edges[1].rising == false);
+}
+
+TEST_CASE("Gradient edge detection on noisy signal", "[decoder][edges][gradient][noise]") {
+    // Create a square wave with noise — gradient should still find the right edges
+    std::mt19937 rng(42);
+    std::normal_distribution<float> noise(0.0f, 10.0f);
+
+    Scanline signal(100);
+    for (int i = 0; i < 100; ++i) {
+        float base = ((i / 10) % 2 == 0) ? 20.0f : 230.0f;
+        signal[i] = std::clamp(base + noise(rng), 0.0f, 255.0f);
+    }
+
+    auto edges_thresh = detect_edges(signal);
+    auto edges_grad = detect_edges_gradient(signal);
+
+    // Both methods should find transitions in a 10-segment square wave
+    REQUIRE(edges_grad.size() >= 5);
+    REQUIRE(edges_grad.size() <= 30);
+}
+
+TEST_CASE("Otsu threshold on bimodal signal", "[decoder][otsu]") {
+    // Bimodal: half the values near 50, half near 200
+    Scanline signal;
+    for (int i = 0; i < 50; ++i) signal.push_back(50.0f);
+    for (int i = 0; i < 50; ++i) signal.push_back(200.0f);
+
+    float thresh = otsu_threshold(signal);
+
+    // Otsu should find threshold between the two modes
+    REQUIRE(thresh >= 50.0f);
+    REQUIRE(thresh <= 200.0f);
+}
+
+TEST_CASE("Otsu threshold is better than midpoint for asymmetric signal", "[decoder][otsu]") {
+    // 80% low values, 20% high values — midpoint will be wrong
+    Scanline signal;
+    for (int i = 0; i < 80; ++i) signal.push_back(30.0f);
+    for (int i = 0; i < 20; ++i) signal.push_back(220.0f);
+
+    float midpoint = (30.0f + 220.0f) / 2.0f; // 125 — too high for this distribution
+    float otsu = otsu_threshold(signal);
+
+    // Otsu should be lower than midpoint, closer to the boundary
+    REQUIRE(otsu < midpoint);
+    REQUIRE(otsu >= 30.0f);
+}
+
+TEST_CASE("Decode synthetic EAN-13 with gradient method", "[decoder][ean13][gradient]") {
+    std::string code = "5901234123457";
+    auto scanline = make_perfect_scanline(code, 3.0f);
+    auto result = decode_scanline(scanline, EdgeMethod::Gradient);
+    REQUIRE(result.success);
+    REQUIRE(result.text == code);
 }
 
 TEST_CASE("Decode fails on garbage data", "[decoder][ean13]") {

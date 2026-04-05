@@ -100,6 +100,100 @@ TEST_CASE("Pipeline with noisy signal and DCT denoising", "[integration][dct][no
     REQUIRE(result_filtered.text == code);
 }
 
+TEST_CASE("Blur + WienerDeconv recovers EAN-13 decode", "[integration][deblur]") {
+    std::string code = "5901234123457";
+    auto img = make_ean13_image(code, 5, 50);
+
+    BarcodeRegion region{0, 0, static_cast<float>(img.width), static_cast<float>(img.height), {1.0f, 0.0f}};
+    ExtractionParams params;
+    params.num_scanlines = 1;
+
+    auto lines = extract_scanlines(img, region, params);
+    auto scanline = lines[0];
+
+    // Mild blur (sigma=1.0 relative to module_width=5)
+    float blur_sigma = 1.0f;
+    FilterParams blur_params;
+    blur_params.type = FilterType::Gaussian;
+    blur_params.sigma = blur_sigma;
+    auto blurred = dct_filter(scanline, blur_params);
+
+    // Deconvolve
+    FilterParams deconv_params;
+    deconv_params.type = FilterType::WienerDeconv;
+    deconv_params.blur_sigma = blur_sigma;
+    deconv_params.noise_ratio = 0.01f;
+    auto recovered = dct_filter(blurred, deconv_params);
+
+    auto result_recovered = decode_scanline(recovered);
+    REQUIRE(result_recovered.success);
+    REQUIRE(result_recovered.text == code);
+}
+
+TEST_CASE("Blur + HighBoost recovers EAN-13 decode", "[integration][deblur]") {
+    std::string code = "5901234123457";
+    auto img = make_ean13_image(code, 5, 50);
+
+    BarcodeRegion region{0, 0, static_cast<float>(img.width), static_cast<float>(img.height), {1.0f, 0.0f}};
+    ExtractionParams params;
+    params.num_scanlines = 1;
+
+    auto lines = extract_scanlines(img, region, params);
+    auto scanline = lines[0];
+
+    // Mild blur
+    FilterParams blur_params;
+    blur_params.type = FilterType::Gaussian;
+    blur_params.sigma = 1.0f;
+    auto blurred = dct_filter(scanline, blur_params);
+
+    // High-boost to sharpen
+    FilterParams boost_params;
+    boost_params.type = FilterType::HighBoost;
+    boost_params.boost = 2.0f;
+    boost_params.sigma = 3.0f;
+    auto sharpened = dct_filter(blurred, boost_params);
+
+    auto result = decode_scanline(sharpened);
+    REQUIRE(result.success);
+    REQUIRE(result.text == code);
+}
+
+TEST_CASE("Auto blur estimation + WienerDeconv recovers EAN-13 decode", "[integration][deblur]") {
+    std::string code = "5901234123457";
+    auto img = make_ean13_image(code, 5, 50);
+
+    BarcodeRegion region{0, 0, static_cast<float>(img.width), static_cast<float>(img.height), {1.0f, 0.0f}};
+    ExtractionParams params;
+    params.num_scanlines = 1;
+
+    auto lines = extract_scanlines(img, region, params);
+    auto scanline = lines[0];
+
+    // Blur the scanline
+    float true_sigma = 1.5f;
+    FilterParams blur_params;
+    blur_params.type = FilterType::Gaussian;
+    blur_params.sigma = true_sigma;
+    auto blurred = dct_filter(scanline, blur_params);
+
+    // Estimate blur from the blurred signal
+    auto coeffs = dct_ii(blurred);
+    float estimated_sigma = estimate_blur_sigma(coeffs);
+    REQUIRE(estimated_sigma > 0.0f);
+
+    // Use estimated sigma for deconvolution
+    FilterParams deconv_params;
+    deconv_params.type = FilterType::WienerDeconv;
+    deconv_params.blur_sigma = estimated_sigma;
+    deconv_params.noise_ratio = 0.01f;
+    auto recovered = dct_filter(blurred, deconv_params);
+
+    auto result = decode_scanline(recovered);
+    REQUIRE(result.success);
+    REQUIRE(result.text == code);
+}
+
 TEST_CASE("Multiple scanline averaging + DCT", "[integration][averaging]") {
     std::string code = "9780201379624";
     auto img = make_ean13_image(code, 3, 50);

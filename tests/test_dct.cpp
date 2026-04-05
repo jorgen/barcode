@@ -145,6 +145,255 @@ TEST_CASE("Hard threshold filter", "[dct][filter]") {
     REQUIRE(std::abs(filtered[0]) > 0.01f); // DC survives
 }
 
+TEST_CASE("Gaussian filter reduces noise while preserving signal shape", "[dct][filter]") {
+    // Low-frequency signal + high-frequency noise
+    const int N = 256;
+    Scanline signal(N);
+    Scanline clean(N);
+    std::mt19937 rng(99);
+    std::normal_distribution<float> noise_dist(0.0f, 15.0f);
+
+    for (int i = 0; i < N; ++i) {
+        // 1 cycle over N samples — concentrated at k=1 in DCT
+        float smooth = 128.0f + 60.0f * std::sin(2.0f * std::numbers::pi_v<float> * i / N);
+        clean[i] = smooth;
+        signal[i] = smooth + noise_dist(rng);
+    }
+
+    FilterParams params;
+    params.type = FilterType::Gaussian;
+    params.sigma = 2.0f; // sigma_freq ≈ N/(2*pi*2) ≈ 20 — passes low freqs, cuts high
+
+    auto filtered = dct_filter(signal, params);
+
+    float error_before = 0.0f, error_after = 0.0f;
+    for (int i = 0; i < N; ++i) {
+        error_before += (signal[i] - clean[i]) * (signal[i] - clean[i]);
+        error_after += (filtered[i] - clean[i]) * (filtered[i] - clean[i]);
+    }
+
+    REQUIRE(error_after < error_before);
+}
+
+TEST_CASE("Gaussian filter round-trip preserves DC", "[dct][filter]") {
+    Scanline signal(64, 100.0f);
+    FilterParams params;
+    params.type = FilterType::Gaussian;
+    params.sigma = 5.0f;
+
+    auto filtered = dct_filter(signal, params);
+
+    for (size_t i = 0; i < signal.size(); ++i) {
+        REQUIRE_THAT(filtered[i], WithinAbs(100.0f, 0.1));
+    }
+}
+
+TEST_CASE("Wiener filter preserves strong signal components", "[dct][filter]") {
+    // Strong sinusoid + weak noise
+    Scanline signal(128);
+    Scanline clean(128);
+    std::mt19937 rng(77);
+    std::normal_distribution<float> noise_dist(0.0f, 5.0f);
+
+    for (size_t i = 0; i < signal.size(); ++i) {
+        float s = 128.0f + 80.0f * std::sin(2.0f * std::numbers::pi_v<float> * i / 128.0f * 6.0f);
+        clean[i] = s;
+        signal[i] = s + noise_dist(rng);
+    }
+
+    FilterParams params;
+    params.type = FilterType::Wiener;
+    params.noise_power = 50.0f;
+
+    auto filtered = dct_filter(signal, params);
+
+    float error_before = 0.0f, error_after = 0.0f;
+    for (size_t i = 0; i < signal.size(); ++i) {
+        error_before += (signal[i] - clean[i]) * (signal[i] - clean[i]);
+        error_after += (filtered[i] - clean[i]) * (filtered[i] - clean[i]);
+    }
+
+    REQUIRE(error_after < error_before);
+}
+
+TEST_CASE("Wiener filter with zero noise power is identity", "[dct][filter]") {
+    std::mt19937 rng(55);
+    std::uniform_real_distribution<float> dist(0.0f, 255.0f);
+
+    Scanline signal(64);
+    for (auto& v : signal) v = dist(rng);
+
+    FilterParams params;
+    params.type = FilterType::Wiener;
+    params.noise_power = 0.0f;
+
+    auto filtered = dct_filter(signal, params);
+
+    for (size_t i = 0; i < signal.size(); ++i) {
+        REQUIRE_THAT(filtered[i], WithinAbs(signal[i], 0.1));
+    }
+}
+
+TEST_CASE("WienerDeconv with blur_sigma=0 is near-identity", "[dct][deblur]") {
+    std::mt19937 rng(101);
+    std::uniform_real_distribution<float> dist(0.0f, 255.0f);
+
+    Scanline signal(64);
+    for (auto& v : signal) v = dist(rng);
+
+    FilterParams params;
+    params.type = FilterType::WienerDeconv;
+    params.blur_sigma = 0.0f;
+    params.noise_ratio = 0.0001f;
+
+    auto filtered = dct_filter(signal, params);
+
+    for (size_t i = 0; i < signal.size(); ++i) {
+        REQUIRE_THAT(filtered[i], WithinAbs(signal[i], 0.5));
+    }
+}
+
+TEST_CASE("WienerDeconv recovers Gaussian-blurred square wave", "[dct][deblur]") {
+    const int N = 128;
+
+    // Create a sharp square wave
+    Scanline sharp(N);
+    for (int i = 0; i < N; ++i) {
+        sharp[i] = (i % 16 < 8) ? 200.0f : 50.0f;
+    }
+
+    // Blur it with a Gaussian filter
+    float blur_sigma = 2.0f;
+    FilterParams blur_params;
+    blur_params.type = FilterType::Gaussian;
+    blur_params.sigma = blur_sigma;
+    auto blurred = dct_filter(sharp, blur_params);
+
+    // Measure error before deconvolution
+    float error_blurred = 0.0f;
+    for (int i = 0; i < N; ++i) {
+        float d = blurred[i] - sharp[i];
+        error_blurred += d * d;
+    }
+
+    // Deconvolve
+    FilterParams deconv_params;
+    deconv_params.type = FilterType::WienerDeconv;
+    deconv_params.blur_sigma = blur_sigma;
+    deconv_params.noise_ratio = 0.01f;
+    auto recovered = dct_filter(blurred, deconv_params);
+
+    float error_recovered = 0.0f;
+    for (int i = 0; i < N; ++i) {
+        float d = recovered[i] - sharp[i];
+        error_recovered += d * d;
+    }
+
+    REQUIRE(error_recovered < error_blurred);
+}
+
+TEST_CASE("WienerDeconv with high noise_ratio suppresses output", "[dct][deblur]") {
+    Scanline signal(64);
+    for (size_t i = 0; i < signal.size(); ++i) {
+        signal[i] = (i % 8 < 4) ? 200.0f : 50.0f;
+    }
+
+    FilterParams params;
+    params.type = FilterType::WienerDeconv;
+    params.blur_sigma = 1.0f;
+    params.noise_ratio = 1000.0f; // Extreme regularization
+
+    auto filtered = dct_filter(signal, params);
+
+    // With huge noise_ratio, all gain -> 0 except maybe DC
+    // The filtered signal should be much flatter than the original
+    auto [min_orig, max_orig] = std::minmax_element(signal.begin(), signal.end());
+    auto [min_filt, max_filt] = std::minmax_element(filtered.begin(), filtered.end());
+    float range_orig = *max_orig - *min_orig;
+    float range_filt = *max_filt - *min_filt;
+
+    REQUIRE(range_filt < range_orig * 0.5f);
+}
+
+TEST_CASE("HighBoost preserves DC on constant signal", "[dct][deblur]") {
+    Scanline signal(64, 150.0f);
+
+    FilterParams params;
+    params.type = FilterType::HighBoost;
+    params.boost = 3.0f;
+    params.sigma = 3.0f;
+
+    auto filtered = dct_filter(signal, params);
+
+    // DC preserved: all values should remain ~150
+    for (size_t i = 0; i < signal.size(); ++i) {
+        REQUIRE_THAT(filtered[i], WithinAbs(150.0f, 0.1));
+    }
+}
+
+TEST_CASE("HighBoost amplifies high-frequency coefficients more than low", "[dct][deblur]") {
+    // Signal with both low and high frequency components
+    const int N = 128;
+    Scanline signal(N);
+    for (int i = 0; i < N; ++i) {
+        signal[i] = 128.0f
+            + 50.0f * std::sin(2.0f * std::numbers::pi_v<float> * i / N * 2.0f)   // low freq
+            + 20.0f * std::sin(2.0f * std::numbers::pi_v<float> * i / N * 40.0f);  // high freq
+    }
+
+    auto coeffs = dct_ii(signal);
+
+    FilterParams params;
+    params.type = FilterType::HighBoost;
+    params.boost = 2.0f;
+    params.sigma = 3.0f;
+
+    auto boosted = apply_filter(coeffs, params);
+
+    // High-frequency coefficients should be amplified more than low-frequency ones
+    // Check ratio at low-freq index (~2) vs high-freq index (~40)
+    float ratio_low = (coeffs[2] != 0.0f) ? boosted[2] / coeffs[2] : 1.0f;
+    float ratio_high = (coeffs[40] != 0.0f) ? boosted[40] / coeffs[40] : 1.0f;
+
+    REQUIRE(ratio_high > ratio_low);
+}
+
+TEST_CASE("estimate_blur_sigma returns ~0 for sharp signal and recovers known sigma", "[dct][deblur]") {
+    const int N = 256;
+
+    SECTION("sharp signal returns small sigma") {
+        // White noise has flat power spectrum — no Gaussian rolloff
+        std::mt19937 rng(202);
+        std::uniform_real_distribution<float> dist(0.0f, 255.0f);
+        Scanline sharp(N);
+        for (auto& v : sharp) v = dist(rng);
+        auto coeffs = dct_ii(sharp);
+        float sigma = estimate_blur_sigma(coeffs);
+        REQUIRE(sigma < 1.0f);
+    }
+
+    SECTION("recovers known blur sigma within ~50%") {
+        // Create a sharp signal then blur it
+        Scanline sharp(N);
+        for (int i = 0; i < N; ++i) {
+            sharp[i] = (i % 8 < 4) ? 255.0f : 0.0f;
+        }
+
+        float true_sigma = 3.0f;
+        FilterParams blur_params;
+        blur_params.type = FilterType::Gaussian;
+        blur_params.sigma = true_sigma;
+        auto blurred = dct_filter(sharp, blur_params);
+
+        auto coeffs = dct_ii(blurred);
+        float estimated = estimate_blur_sigma(coeffs);
+
+        // Should be within 50% of true value
+        REQUIRE(estimated > true_sigma * 0.5f);
+        REQUIRE(estimated < true_sigma * 1.5f);
+    }
+}
+
 TEST_CASE("Power spectrum", "[dct]") {
     Scanline signal(64);
     for (size_t i = 0; i < signal.size(); ++i) {

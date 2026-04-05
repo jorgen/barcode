@@ -112,6 +112,100 @@ std::vector<Edge> detect_edges(const Scanline& signal, float threshold) {
     return edges;
 }
 
+std::vector<Edge> detect_edges_gradient(const Scanline& signal, float min_gradient) {
+    if (signal.size() < 3) return {};
+
+    const int N = static_cast<int>(signal.size());
+
+    // Compute first derivative
+    std::vector<float> deriv(N - 1);
+    for (int i = 0; i < N - 1; ++i) {
+        deriv[i] = signal[i + 1] - signal[i];
+    }
+
+    // Auto min_gradient: use median absolute derivative
+    if (min_gradient == 0.0f) {
+        std::vector<float> abs_deriv(deriv.size());
+        for (size_t i = 0; i < deriv.size(); ++i) {
+            abs_deriv[i] = std::abs(deriv[i]);
+        }
+        std::sort(abs_deriv.begin(), abs_deriv.end());
+        float median = abs_deriv[abs_deriv.size() / 2];
+        // Use 2x median as threshold — filters flat regions while keeping real edges
+        min_gradient = std::max(median * 2.0f, 1.0f);
+    }
+
+    // Find local extrema in derivative that exceed the threshold
+    std::vector<Edge> edges;
+    for (int i = 1; i < static_cast<int>(deriv.size()) - 1; ++i) {
+        bool is_max = deriv[i] > deriv[i - 1] && deriv[i] > deriv[i + 1];
+        bool is_min = deriv[i] < deriv[i - 1] && deriv[i] < deriv[i + 1];
+
+        if (!is_max && !is_min) continue;
+        if (std::abs(deriv[i]) < min_gradient) continue;
+
+        // Sub-pixel interpolation via parabolic fit on derivative peak
+        float a = deriv[i - 1];
+        float b = deriv[i];
+        float c = deriv[i + 1];
+        float offset = 0.5f * (a - c) / (a - 2.0f * b + c);
+
+        // Edge position: derivative index i is between signal[i] and signal[i+1]
+        // So the edge center is at signal index i + 0.5 + offset
+        float pos = static_cast<float>(i) + 0.5f + offset;
+
+        bool rising = deriv[i] > 0; // positive derivative = value increasing = dark-to-light
+        edges.push_back({pos, rising});
+    }
+
+    return edges;
+}
+
+float otsu_threshold(const Scanline& signal) {
+    if (signal.empty()) return 0.0f;
+
+    // Build histogram (256 bins for [0, 255] signal range)
+    constexpr int BINS = 256;
+    std::array<int, BINS> hist{};
+    for (float v : signal) {
+        int bin = std::clamp(static_cast<int>(v), 0, BINS - 1);
+        hist[bin]++;
+    }
+
+    int total = static_cast<int>(signal.size());
+    float sum_all = 0.0f;
+    for (int i = 0; i < BINS; ++i) {
+        sum_all += static_cast<float>(i) * hist[i];
+    }
+
+    float sum_bg = 0.0f;
+    int weight_bg = 0;
+    float max_variance = 0.0f;
+    int best_threshold = 0;
+
+    for (int t = 0; t < BINS; ++t) {
+        weight_bg += hist[t];
+        if (weight_bg == 0) continue;
+
+        int weight_fg = total - weight_bg;
+        if (weight_fg == 0) break;
+
+        sum_bg += static_cast<float>(t) * hist[t];
+        float mean_bg = sum_bg / weight_bg;
+        float mean_fg = (sum_all - sum_bg) / weight_fg;
+
+        float diff = mean_bg - mean_fg;
+        float variance = static_cast<float>(weight_bg) * static_cast<float>(weight_fg) * diff * diff;
+
+        if (variance > max_variance) {
+            max_variance = variance;
+            best_threshold = t;
+        }
+    }
+
+    return static_cast<float>(best_threshold);
+}
+
 std::vector<float> measure_widths(const std::vector<Edge>& edges) {
     std::vector<float> widths;
     if (edges.size() < 2) return widths;
@@ -243,8 +337,17 @@ DecodeResult decode_ean13(const std::vector<float>& widths) {
     return {true, text, confidence, "EAN-13"};
 }
 
-DecodeResult decode_scanline(const Scanline& signal) {
-    auto edges = detect_edges(signal);
+DecodeResult decode_scanline(const Scanline& signal, EdgeMethod method) {
+    std::vector<Edge> edges;
+    switch (method) {
+    case EdgeMethod::Threshold:
+        edges = detect_edges(signal);
+        break;
+    case EdgeMethod::Gradient:
+        edges = detect_edges_gradient(signal);
+        break;
+    }
+
     if (edges.empty()) {
         return {false, "", 0.0f, ""};
     }

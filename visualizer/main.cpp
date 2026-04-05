@@ -33,13 +33,21 @@ struct AppState {
     float dir_x = 1.0f, dir_y = 0.0f;
 
     // Pipeline params
-    int filter_type_idx = 1; // 0=none, 1=lowpass, 2=hard, 3=soft, 4=bandpass
+    int filter_type_idx = 1; // 0=none, 1=lowpass, 2=hard, 3=soft, 4=bandpass, 5=gaussian, 6=wiener, 7=wiener_deconv, 8=highboost
     float cutoff = 0.3f;
     float threshold = 10.0f;
     int band_low = 0;
     int band_high = 50;
+    float sigma = 3.0f;
+    float noise_power = 10.0f;
+    float blur_sigma = 1.0f;
+    float noise_ratio = 0.01f;
+    float boost = 1.0f;
+    float estimated_blur_sigma = 0.0f;
     int num_scanlines = 5;
     float scanline_spacing = 2.0f;
+    int edge_method_idx = 0; // 0=threshold, 1=gradient
+    float min_gradient = 0.0f;
 
     // Pipeline results
     std::vector<bc::Scanline> raw_scanlines;
@@ -105,6 +113,18 @@ static bc::FilterParams build_filter_params(const AppState& s) {
             fp.type = bc::FilterType::BandPass;
             fp.band_low = s.band_low;
             fp.band_high = s.band_high;
+            break;
+        case 5: fp.type = bc::FilterType::Gaussian; fp.sigma = s.sigma; break;
+        case 6: fp.type = bc::FilterType::Wiener;   fp.noise_power = s.noise_power; break;
+        case 7:
+            fp.type = bc::FilterType::WienerDeconv;
+            fp.blur_sigma = s.blur_sigma;
+            fp.noise_ratio = s.noise_ratio;
+            break;
+        case 8:
+            fp.type = bc::FilterType::HighBoost;
+            fp.boost = s.boost;
+            fp.sigma = s.sigma;
             break;
         default: break; // filter_type_idx == 0 handled by caller
     }
@@ -227,8 +247,13 @@ static void run_pipeline(AppState& s) {
     }
 
     // Edge detection & decode
-    s.edges = bc::detect_edges(s.filtered);
-    s.result = bc::decode_scanline(s.filtered);
+    auto edge_method = s.edge_method_idx == 1 ? bc::EdgeMethod::Gradient : bc::EdgeMethod::Threshold;
+    if (edge_method == bc::EdgeMethod::Gradient) {
+        s.edges = bc::detect_edges_gradient(s.filtered, s.min_gradient);
+    } else {
+        s.edges = bc::detect_edges(s.filtered);
+    }
+    s.result = bc::decode_scanline(s.filtered, edge_method);
 
     // Full-image filtered view
     filter_full_image(s);
@@ -358,9 +383,10 @@ int main(int argc, char* argv[]) {
         // Filter controls
         {
             const char* filter_names[] = {"None", "Low Pass", "Hard Threshold",
-                                          "Soft Threshold", "Band Pass"};
+                                          "Soft Threshold", "Band Pass", "Gaussian", "Wiener",
+                                          "Wiener Deconv", "High Boost"};
             ImGui::PushItemWidth(130);
-            if (ImGui::Combo("Filter", &state.filter_type_idx, filter_names, 5)) {
+            if (ImGui::Combo("Filter", &state.filter_type_idx, filter_names, 9)) {
                 state.pipeline_dirty = true;
             }
             ImGui::PopItemWidth();
@@ -378,6 +404,39 @@ int main(int argc, char* argv[]) {
                     state.pipeline_dirty = true;
                 ImGui::SameLine();
                 if (ImGui::SliderInt("Band High", &state.band_high, 0, 200))
+                    state.pipeline_dirty = true;
+            } else if (state.filter_type_idx == 5) {
+                if (ImGui::SliderFloat("Sigma", &state.sigma, 1.0f, 10.0f, "%.1f"))
+                    state.pipeline_dirty = true;
+            } else if (state.filter_type_idx == 6) {
+                if (ImGui::SliderFloat("Noise Power", &state.noise_power, 0.0f, 1000.0f, "%.1f"))
+                    state.pipeline_dirty = true;
+            } else if (state.filter_type_idx == 7) {
+                if (ImGui::SliderFloat("Blur Sigma", &state.blur_sigma, 0.1f, 10.0f, "%.2f"))
+                    state.pipeline_dirty = true;
+                ImGui::SameLine();
+                float log_nr = std::log10(state.noise_ratio);
+                if (ImGui::SliderFloat("Noise Ratio", &log_nr, -3.0f, 0.0f, "%.2f")) {
+                    state.noise_ratio = std::pow(10.0f, log_nr);
+                    state.pipeline_dirty = true;
+                }
+                ImGui::SameLine();
+                if (ImGui::Button("Auto")) {
+                    if (!state.dct_coeffs.empty()) {
+                        state.estimated_blur_sigma = bc::estimate_blur_sigma(state.dct_coeffs);
+                        if (state.estimated_blur_sigma > 0.0f) {
+                            state.blur_sigma = state.estimated_blur_sigma;
+                            state.pipeline_dirty = true;
+                        }
+                    }
+                }
+                ImGui::SameLine();
+                ImGui::Text("Est: %.2f", state.estimated_blur_sigma);
+            } else if (state.filter_type_idx == 8) {
+                if (ImGui::SliderFloat("Boost", &state.boost, 0.0f, 5.0f, "%.2f"))
+                    state.pipeline_dirty = true;
+                ImGui::SameLine();
+                if (ImGui::SliderFloat("Sigma", &state.sigma, 1.0f, 10.0f, "%.1f"))
                     state.pipeline_dirty = true;
             }
             ImGui::PopItemWidth();
@@ -397,6 +456,23 @@ int main(int argc, char* argv[]) {
             ImGui::SameLine();
             if (ImGui::Checkbox("2D Filter", &state.filter_2d))
                 state.pipeline_dirty = true;
+        }
+
+        // Edge detection controls
+        {
+            const char* edge_names[] = {"Threshold", "Gradient"};
+            ImGui::PushItemWidth(130);
+            if (ImGui::Combo("Edge Method", &state.edge_method_idx, edge_names, 2))
+                state.pipeline_dirty = true;
+            ImGui::PopItemWidth();
+
+            if (state.edge_method_idx == 1) {
+                ImGui::SameLine();
+                ImGui::PushItemWidth(150);
+                if (ImGui::SliderFloat("Min Gradient", &state.min_gradient, 0.0f, 50.0f, "%.1f"))
+                    state.pipeline_dirty = true;
+                ImGui::PopItemWidth();
+            }
         }
 
         ImGui::Separator();
@@ -683,11 +759,12 @@ int main(int argc, char* argv[]) {
         if (state.image_loaded) {
             if (state.result.success) {
                 ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.2f, 1.0f),
-                    "Result: %s  %s  confidence: %.2f",
+                    "Result: %s  %s  confidence: %.2f  edges: %d",
                     state.result.format.c_str(), state.result.text.c_str(),
-                    state.result.confidence);
+                    state.result.confidence, static_cast<int>(state.edges.size()));
             } else {
-                ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f), "Decode failed");
+                ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f),
+                    "Decode failed  edges: %d", static_cast<int>(state.edges.size()));
             }
         }
 
