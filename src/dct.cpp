@@ -145,6 +145,10 @@ std::vector<float> power_spectrum(const std::vector<float>& coefficients) {
     return spectrum;
 }
 
+Scanline dct_autocorrelation(const Scanline& signal) {
+    return dct_iii(power_spectrum(dct_ii(signal)));
+}
+
 float estimate_blur_sigma(const std::vector<float>& coefficients) {
     const int N = static_cast<int>(coefficients.size());
     if (N < 16) return 0.0f;

@@ -44,6 +44,9 @@ Scanline dct_filter(const Scanline& signal, const FilterParams& params);
 // Power spectrum |X_k|^2 for analysis
 std::vector<float> power_spectrum(const std::vector<float>& coefficients);
 
+// Autocorrelation via Wiener-Khinchin theorem: IDCT(|DCT(signal)|^2)
+[[nodiscard]] Scanline dct_autocorrelation(const Scanline& signal);
+
 // Estimate blur sigma from power spectrum rolloff.
 // Returns 0 if the signal appears unblurred.
 float estimate_blur_sigma(const std::vector<float>& coefficients);

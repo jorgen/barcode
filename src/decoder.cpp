@@ -1,9 +1,11 @@
 #include "decoder.h"
+#include "dct.h"
 
 #include <algorithm>
 #include <array>
 #include <cmath>
 #include <numeric>
+#include <string>
 
 namespace bc {
 
@@ -354,6 +356,404 @@ DecodeResult decode_scanline(const Scanline& signal, EdgeMethod method) {
 
     auto widths = measure_widths(edges);
     return decode_ean13(widths);
+}
+
+// --- Correlation-based decoder ---
+
+float estimate_module_width(const Scanline& signal) {
+    const int N = static_cast<int>(signal.size());
+    if (N < 20) return 0.0f;
+
+    // Mean-subtract to focus on AC structure
+    float mean = 0.0f;
+    for (float v : signal) mean += v;
+    mean /= static_cast<float>(N);
+
+    Scanline centered(N);
+    for (int i = 0; i < N; ++i) {
+        centered[i] = signal[i] - mean;
+    }
+
+    auto autocorr = dct_autocorrelation(centered);
+
+    // Normalize by autocorr[0]
+    if (std::abs(autocorr[0]) < 1e-9f) return 0.0f;
+    float norm = autocorr[0];
+    for (auto& v : autocorr) v /= norm;
+
+    // Find first local minimum after lag 0 (anti-correlation from bar/space alternation).
+    // Shifting by one module width turns bars into spaces → maximum anti-correlation.
+    // So the first minimum lag ≈ module_width.
+    int first_min = -1;
+    for (int i = 2; i < N / 2; ++i) {
+        if (autocorr[i] < autocorr[i - 1] && autocorr[i] <= autocorr[i + 1]) {
+            first_min = i;
+            break;
+        }
+    }
+    if (first_min < 0) return 0.0f;
+
+    // Parabolic refinement for sub-sample precision
+    float a = autocorr[first_min - 1];
+    float b = autocorr[first_min];
+    float c = autocorr[first_min + 1];
+    float denom = a - 2.0f * b + c;
+    float offset = 0.0f;
+    if (std::abs(denom) > 1e-9f) {
+        offset = 0.5f * (a - c) / denom;
+    }
+    float mw = static_cast<float>(first_min) + offset;
+
+    // Sanity check
+    float max_mw = static_cast<float>(N) / 20.0f;
+    if (mw < 1.0f || mw > max_mw) return 0.0f;
+
+    return mw;
+}
+
+Scanline make_digit_template(int digit, float module_width, char code_type) {
+    auto pattern = L_PATTERNS[digit];
+
+    // G-code: reverse the pattern
+    std::array<int, 4> p;
+    if (code_type == 'G') {
+        for (int i = 0; i < 4; ++i) p[i] = pattern[3 - i];
+    } else {
+        p = pattern;
+    }
+
+    int total_samples = static_cast<int>(std::round(7.0f * module_width));
+    Scanline templ(total_samples);
+
+    // L/G-code: starts with space (255), alternates space/bar/space/bar
+    // R-code: invert polarity — starts with bar (0), alternates bar/space/bar/space
+    float bar_val = (code_type == 'R') ? 255.0f : 0.0f;
+    float space_val = (code_type == 'R') ? 0.0f : 255.0f;
+
+    int pos = 0;
+    for (int i = 0; i < 4; ++i) {
+        float val = (i % 2 == 0) ? space_val : bar_val;
+        int width = static_cast<int>(std::round((pos + p[i]) * module_width)) -
+                    static_cast<int>(std::round(pos * module_width));
+        for (int j = 0; j < width && (static_cast<int>(std::round(pos * module_width)) + j) < total_samples; ++j) {
+            templ[static_cast<int>(std::round(pos * module_width)) + j] = val;
+        }
+        pos += p[i];
+    }
+
+    return templ;
+}
+
+Scanline make_guard_template(const std::string& guard_type, float module_width) {
+    if (guard_type == "center") {
+        // space-bar-space-bar-space (5 modules)
+        int total = static_cast<int>(std::round(5.0f * module_width));
+        Scanline templ(total);
+        for (int i = 0; i < 5; ++i) {
+            float val = (i % 2 == 0) ? 255.0f : 0.0f;
+            int start = static_cast<int>(std::round(i * module_width));
+            int end = static_cast<int>(std::round((i + 1) * module_width));
+            for (int j = start; j < end && j < total; ++j) {
+                templ[j] = val;
+            }
+        }
+        return templ;
+    }
+
+    // left/right guard: bar-space-bar (3 modules)
+    int total = static_cast<int>(std::round(3.0f * module_width));
+    Scanline templ(total);
+    for (int i = 0; i < 3; ++i) {
+        float val = (i % 2 == 0) ? 0.0f : 255.0f;
+        int start = static_cast<int>(std::round(i * module_width));
+        int end = static_cast<int>(std::round((i + 1) * module_width));
+        for (int j = start; j < end && j < total; ++j) {
+            templ[j] = val;
+        }
+    }
+    return templ;
+}
+
+float normalized_cross_correlation(const Scanline& a, const Scanline& b) {
+    if (a.size() != b.size() || a.empty()) return 0.0f;
+    const int N = static_cast<int>(a.size());
+
+    float mean_a = 0.0f, mean_b = 0.0f;
+    for (int i = 0; i < N; ++i) {
+        mean_a += a[i];
+        mean_b += b[i];
+    }
+    mean_a /= N;
+    mean_b /= N;
+
+    float dot = 0.0f, var_a = 0.0f, var_b = 0.0f;
+    for (int i = 0; i < N; ++i) {
+        float da = a[i] - mean_a;
+        float db = b[i] - mean_b;
+        dot += da * db;
+        var_a += da * da;
+        var_b += db * db;
+    }
+
+    float denom = std::sqrt(var_a * var_b);
+    if (denom < 1e-9f) return 0.0f;
+    return dot / denom;
+}
+
+CorrelationMatch slide_correlate(const Scanline& signal, const Scanline& templ) {
+    const int sig_n = static_cast<int>(signal.size());
+    const int tmpl_n = static_cast<int>(templ.size());
+    if (tmpl_n > sig_n || tmpl_n == 0) return {};
+
+    CorrelationMatch best;
+    for (int pos = 0; pos <= sig_n - tmpl_n; ++pos) {
+        Scanline window(signal.begin() + pos, signal.begin() + pos + tmpl_n);
+        float ncc = normalized_cross_correlation(window, templ);
+        if (ncc > best.correlation) {
+            best.correlation = ncc;
+            best.position = pos;
+        }
+    }
+    return best;
+}
+
+// Compute NCC between template and signal at given offset, without allocating.
+static float ncc_at(const Scanline& signal, const Scanline& templ, int offset) {
+    const int N = static_cast<int>(templ.size());
+    if (offset < 0 || offset + N > static_cast<int>(signal.size())) return -2.0f;
+
+    float mean_s = 0.0f, mean_t = 0.0f;
+    for (int i = 0; i < N; ++i) {
+        mean_s += signal[offset + i];
+        mean_t += templ[i];
+    }
+    mean_s /= static_cast<float>(N);
+    mean_t /= static_cast<float>(N);
+
+    float dot = 0.0f, var_s = 0.0f, var_t = 0.0f;
+    for (int i = 0; i < N; ++i) {
+        float ds = signal[offset + i] - mean_s;
+        float dt = templ[i] - mean_t;
+        dot += ds * dt;
+        var_s += ds * ds;
+        var_t += dt * dt;
+    }
+
+    float denom = std::sqrt(var_s * var_t);
+    if (denom < 1e-9f) return 0.0f;
+    return dot / denom;
+}
+
+// Attempt correlation decode with a given module width estimate.
+// Returns success only if checksum validates.
+static DecodeResult try_correlation_decode(const Scanline& signal, float trial_mw) {
+    const int N = static_cast<int>(signal.size());
+    float mw = trial_mw;
+
+    // Barcode must fit in signal
+    int barcode_modules = static_cast<int>(std::round(95.0f * mw));
+    if (barcode_modules > N || barcode_modules < 20) return {false, "", 0.0f, "EAN-13"};
+
+    // Use extended guard templates (guard + adjacent quiet zone) for distinctiveness.
+    // Short 3-module guards match many interior bar-space-bar patterns; adding quiet
+    // zone context makes the templates unique to actual guard positions.
+    constexpr int QUIET_MODS = 3;
+    int ext_len = static_cast<int>(std::round((QUIET_MODS + 3) * mw));
+
+    // Extended left guard: quiet(3mw) + bar-space-bar(3mw)
+    Scanline ext_lg(ext_len, 255.0f);
+    int lg_quiet_end = static_cast<int>(std::round(QUIET_MODS * mw));
+    for (int m = 0; m < 3; ++m) {
+        float val = (m % 2 == 0) ? 0.0f : 255.0f;
+        int s = lg_quiet_end + static_cast<int>(std::round(m * mw));
+        int e = lg_quiet_end + static_cast<int>(std::round((m + 1) * mw));
+        for (int j = s; j < e && j < ext_len; ++j) ext_lg[j] = val;
+    }
+
+    // Extended right guard: bar-space-bar(3mw) + quiet(3mw)
+    Scanline ext_rg(ext_len, 255.0f);
+    for (int m = 0; m < 3; ++m) {
+        float val = (m % 2 == 0) ? 0.0f : 255.0f;
+        int s = static_cast<int>(std::round(m * mw));
+        int e = static_cast<int>(std::round((m + 1) * mw));
+        for (int j = s; j < e && j < ext_len; ++j) ext_rg[j] = val;
+    }
+
+    // Two-guard search: find LG local maxima, validate each with RG.
+    // Distance from ext_lg match pos to ext_rg match pos = 95 modules.
+    int barcode_start = -1;
+    float best_combined = -1.0f;
+    int max_start = N - static_cast<int>(std::round((95 + QUIET_MODS) * mw));
+    if (max_start < 0) return {false, "", 0.0f, "EAN-13"};
+
+    float prev_ncc = -2.0f, prev_prev_ncc = -2.0f;
+    for (int pos = 0; pos <= max_start + 1; ++pos) {
+        float ncc = (pos <= max_start) ? ncc_at(signal, ext_lg, pos) : -2.0f;
+
+        if (pos >= 2 && prev_ncc > 0.3f &&
+            prev_ncc >= prev_prev_ncc && prev_ncc >= ncc) {
+            int lg_match = pos - 1;
+
+            // Search for right guard near expected position
+            int expected_rg = lg_match + static_cast<int>(std::round(95.0f * mw));
+            int rg_margin = static_cast<int>(5.0f * mw);
+            int rg_start = std::max(lg_match + ext_len, expected_rg - rg_margin);
+            int rg_end = std::min(N - ext_len, expected_rg + rg_margin);
+
+            float best_rg_ncc = -2.0f;
+            int best_rg_match = -1;
+            for (int rp = rg_start; rp <= rg_end; ++rp) {
+                float rg_ncc = ncc_at(signal, ext_rg, rp);
+                if (rg_ncc > best_rg_ncc) {
+                    best_rg_ncc = rg_ncc;
+                    best_rg_match = rp;
+                }
+            }
+
+            if (best_rg_ncc > 0.3f) {
+                float combined = prev_ncc + best_rg_ncc;
+                if (combined > best_combined) {
+                    best_combined = combined;
+                    // Refine mw from guard pair distance
+                    float refined = static_cast<float>(best_rg_match - lg_match) / 95.0f;
+                    if (refined >= 1.0f) {
+                        mw = refined;
+                        barcode_start = lg_match + static_cast<int>(std::round(QUIET_MODS * mw));
+                    }
+                }
+            }
+        }
+
+        prev_prev_ncc = prev_ncc;
+        prev_ncc = ncc;
+    }
+
+    if (barcode_start < 0) return {false, "", 0.0f, "EAN-13"};
+
+    // Decode left 6 digits
+    int left_data_start = barcode_start + static_cast<int>(std::round(3.0f * mw));
+    std::array<int, 13> digits{};
+    std::array<int, 6> parity{};
+    float total_corr = 0.0f;
+
+    for (int d = 0; d < 6; ++d) {
+        int nominal = left_data_start + static_cast<int>(std::round(d * 7.0f * mw));
+        float best_corr = -2.0f;
+        int best_digit = -1;
+        bool best_is_g = false;
+
+        for (int digit = 0; digit < 10; ++digit) {
+            for (char code : {'L', 'G'}) {
+                auto templ = make_digit_template(digit, mw, code);
+                for (int off = -4; off <= 4; ++off) {
+                    float ncc = ncc_at(signal, templ, nominal + off);
+                    if (ncc > best_corr) {
+                        best_corr = ncc;
+                        best_digit = digit;
+                        best_is_g = (code == 'G');
+                    }
+                }
+            }
+        }
+
+        if (best_digit < 0) return {false, "", 0.0f, "EAN-13"};
+        digits[d + 1] = best_digit;
+        parity[d] = best_is_g ? 1 : 0;
+        total_corr += best_corr;
+    }
+
+    // Decode right 6 digits
+    int right_data_start = left_data_start + static_cast<int>(std::round(47.0f * mw));
+
+    for (int d = 0; d < 6; ++d) {
+        int nominal = right_data_start + static_cast<int>(std::round(d * 7.0f * mw));
+        float best_corr = -2.0f;
+        int best_digit = -1;
+
+        for (int digit = 0; digit < 10; ++digit) {
+            auto templ = make_digit_template(digit, mw, 'R');
+            for (int off = -4; off <= 4; ++off) {
+                float ncc = ncc_at(signal, templ, nominal + off);
+                if (ncc > best_corr) {
+                    best_corr = ncc;
+                    best_digit = digit;
+                }
+            }
+        }
+
+        if (best_digit < 0) return {false, "", 0.0f, "EAN-13"};
+        digits[d + 7] = best_digit;
+        total_corr += best_corr;
+    }
+
+    // First digit from parity pattern
+    int first_digit = -1;
+    for (int d = 0; d < 10; ++d) {
+        bool match = true;
+        for (int i = 0; i < 6; ++i) {
+            if (PARITY_PATTERNS[d][i] != parity[i]) { match = false; break; }
+        }
+        if (match) { first_digit = d; break; }
+    }
+    if (first_digit < 0) return {false, "", 0.0f, "EAN-13"};
+    digits[0] = first_digit;
+
+    // Verify check digit
+    int check_sum = 0;
+    for (int i = 0; i < 12; ++i) {
+        check_sum += digits[i] * (i % 2 == 0 ? 1 : 3);
+    }
+    int expected_check = (10 - (check_sum % 10)) % 10;
+    if (digits[12] != expected_check) return {false, "", 0.0f, "EAN-13"};
+
+    std::string text;
+    text.reserve(13);
+    for (int d : digits) text += static_cast<char>('0' + d);
+
+    float confidence = total_corr / 12.0f;
+    // Reject low-confidence decodes that likely passed checksum by coincidence
+    if (confidence < 0.84f) return {false, "", 0.0f, "EAN-13"};
+    return {true, text, confidence, "EAN-13"};
+}
+
+DecodeResult decode_ean13_correlation(const Scanline& signal) {
+    const int N = static_cast<int>(signal.size());
+    if (N < 30) return {false, "", 0.0f, "EAN-13"};
+
+    DecodeResult best{false, "", 0.0f, "EAN-13"};
+
+    auto try_mw = [&](float trial) {
+        auto result = try_correlation_decode(signal, trial);
+        if (result.success && result.confidence > best.confidence) {
+            best = result;
+        }
+    };
+
+    // Fast path: try autocorrelation-based module width estimate
+    float acorr_mw = estimate_module_width(signal);
+    if (acorr_mw > 0.0f) {
+        try_mw(acorr_mw);
+        if (best.confidence > 0.9f) return best; // high confidence, skip search
+    }
+
+    // Multi-scale search: try a range of module widths, keep highest confidence
+    for (float trial = 1.5f; trial <= 12.0f; trial += 0.25f) {
+        try_mw(trial);
+    }
+
+    return best;
+}
+
+DecodeResult decode_scanline(const Scanline& signal, DecodeMethod method) {
+    switch (method) {
+    case DecodeMethod::EdgeThreshold:
+        return decode_scanline(signal, EdgeMethod::Threshold);
+    case DecodeMethod::EdgeGradient:
+        return decode_scanline(signal, EdgeMethod::Gradient);
+    case DecodeMethod::Correlation:
+        return decode_ean13_correlation(signal);
+    }
+    return {false, "", 0.0f, ""};
 }
 
 } // namespace bc

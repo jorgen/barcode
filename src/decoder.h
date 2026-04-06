@@ -38,4 +38,39 @@ DecodeResult decode_ean13(const std::vector<float>& widths);
 // method selects edge detection strategy.
 DecodeResult decode_scanline(const Scanline& signal, EdgeMethod method = EdgeMethod::Threshold);
 
+// --- Correlation-based decoder ---
+
+// Estimate module width from autocorrelation of the signal.
+[[nodiscard]] float estimate_module_width(const Scanline& signal);
+
+// Generate a waveform template for an EAN-13 digit.
+// code_type: 'L', 'G', or 'R'
+[[nodiscard]] Scanline make_digit_template(int digit, float module_width, char code_type);
+
+// Generate a guard pattern template. guard_type: "left", "right", or "center"
+[[nodiscard]] Scanline make_guard_template(const std::string& guard_type, float module_width);
+
+// Normalized cross-correlation between two equal-length signals. Returns [-1, 1].
+[[nodiscard]] float normalized_cross_correlation(const Scanline& a, const Scanline& b);
+
+struct CorrelationMatch {
+    int position = -1;
+    float correlation = -1.0f;
+};
+
+// Slide template across signal, return position and correlation of best match.
+[[nodiscard]] CorrelationMatch slide_correlate(const Scanline& signal, const Scanline& templ);
+
+// Full correlation-based EAN-13 decode pipeline.
+[[nodiscard]] DecodeResult decode_ean13_correlation(const Scanline& signal);
+
+enum class DecodeMethod {
+    EdgeThreshold,
+    EdgeGradient,
+    Correlation,
+};
+
+// Unified decode entry point with method selection.
+[[nodiscard]] DecodeResult decode_scanline(const Scanline& signal, DecodeMethod method);
+
 } // namespace bc
