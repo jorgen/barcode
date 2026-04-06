@@ -46,7 +46,7 @@ struct AppState {
     float estimated_blur_sigma = 0.0f;
     int num_scanlines = 5;
     float scanline_spacing = 2.0f;
-    int edge_method_idx = 0; // 0=threshold, 1=gradient
+    int decode_method_idx = 0; // 0=edge:threshold, 1=edge:gradient, 2=correlation
     float min_gradient = 0.0f;
 
     // Pipeline results
@@ -58,6 +58,8 @@ struct AppState {
     bc::Scanline filtered;
     std::vector<bc::Edge> edges;
     bc::DecodeResult result;
+    bc::Scanline autocorrelation;
+    float estimated_module_width = 0.0f;
 
     // Full-image filtered view
     bc::Image filtered_image;
@@ -247,13 +249,23 @@ static void run_pipeline(AppState& s) {
     }
 
     // Edge detection & decode
-    auto edge_method = s.edge_method_idx == 1 ? bc::EdgeMethod::Gradient : bc::EdgeMethod::Threshold;
-    if (edge_method == bc::EdgeMethod::Gradient) {
-        s.edges = bc::detect_edges_gradient(s.filtered, s.min_gradient);
+    if (s.decode_method_idx == 2) {
+        // Correlation mode — no edges
+        s.edges.clear();
+        s.autocorrelation = bc::dct_autocorrelation(s.filtered);
+        s.estimated_module_width = bc::estimate_module_width(s.filtered);
+        s.result = bc::decode_scanline(s.filtered, bc::DecodeMethod::Correlation);
     } else {
-        s.edges = bc::detect_edges(s.filtered);
+        s.autocorrelation.clear();
+        s.estimated_module_width = 0.0f;
+        auto edge_method = s.decode_method_idx == 1 ? bc::EdgeMethod::Gradient : bc::EdgeMethod::Threshold;
+        if (edge_method == bc::EdgeMethod::Gradient) {
+            s.edges = bc::detect_edges_gradient(s.filtered, s.min_gradient);
+        } else {
+            s.edges = bc::detect_edges(s.filtered);
+        }
+        s.result = bc::decode_scanline(s.filtered, edge_method);
     }
-    s.result = bc::decode_scanline(s.filtered, edge_method);
 
     // Full-image filtered view
     filter_full_image(s);
@@ -458,15 +470,15 @@ int main(int argc, char* argv[]) {
                 state.pipeline_dirty = true;
         }
 
-        // Edge detection controls
+        // Decode method controls
         {
-            const char* edge_names[] = {"Threshold", "Gradient"};
-            ImGui::PushItemWidth(130);
-            if (ImGui::Combo("Edge Method", &state.edge_method_idx, edge_names, 2))
+            const char* method_names[] = {"Edge: Threshold", "Edge: Gradient", "Correlation"};
+            ImGui::PushItemWidth(150);
+            if (ImGui::Combo("Decode Method", &state.decode_method_idx, method_names, 3))
                 state.pipeline_dirty = true;
             ImGui::PopItemWidth();
 
-            if (state.edge_method_idx == 1) {
+            if (state.decode_method_idx == 1) {
                 ImGui::SameLine();
                 ImGui::PushItemWidth(150);
                 if (ImGui::SliderFloat("Min Gradient", &state.min_gradient, 0.0f, 50.0f, "%.1f"))
@@ -746,9 +758,16 @@ int main(int argc, char* argv[]) {
 
             ImGui::Spacing();
 
-            // 4. Filtered scanline with edge markers
-            ImGui::Text("Filtered Scanline (edges: %d)", static_cast<int>(state.edges.size()));
-            plot_scanline("##filtered", state.filtered, plot_h, &state.edges);
+            // 4. Filtered scanline with edge markers / autocorrelation
+            if (state.decode_method_idx == 2 && !state.autocorrelation.empty()) {
+                ImGui::Text("Autocorrelation (module width: %.2f)", state.estimated_module_width);
+                plot_scanline("##autocorr", state.autocorrelation, plot_h * 0.5f);
+                ImGui::Text("Filtered Scanline");
+                plot_scanline("##filtered", state.filtered, plot_h * 0.5f);
+            } else {
+                ImGui::Text("Filtered Scanline (edges: %d)", static_cast<int>(state.edges.size()));
+                plot_scanline("##filtered", state.filtered, plot_h, &state.edges);
+            }
         } else {
             ImGui::TextWrapped("Load an image to see the processing pipeline.");
         }
@@ -758,13 +777,25 @@ int main(int argc, char* argv[]) {
         ImGui::Separator();
         if (state.image_loaded) {
             if (state.result.success) {
-                ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.2f, 1.0f),
-                    "Result: %s  %s  confidence: %.2f  edges: %d",
-                    state.result.format.c_str(), state.result.text.c_str(),
-                    state.result.confidence, static_cast<int>(state.edges.size()));
+                if (state.decode_method_idx == 2) {
+                    ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.2f, 1.0f),
+                        "Result: %s  %s  confidence: %.2f  module_width: %.2f",
+                        state.result.format.c_str(), state.result.text.c_str(),
+                        state.result.confidence, state.estimated_module_width);
+                } else {
+                    ImGui::TextColored(ImVec4(0.2f, 1.0f, 0.2f, 1.0f),
+                        "Result: %s  %s  confidence: %.2f  edges: %d",
+                        state.result.format.c_str(), state.result.text.c_str(),
+                        state.result.confidence, static_cast<int>(state.edges.size()));
+                }
             } else {
-                ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f),
-                    "Decode failed  edges: %d", static_cast<int>(state.edges.size()));
+                if (state.decode_method_idx == 2) {
+                    ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f),
+                        "Decode failed  module_width: %.2f", state.estimated_module_width);
+                } else {
+                    ImGui::TextColored(ImVec4(1.0f, 0.4f, 0.4f, 1.0f),
+                        "Decode failed  edges: %d", static_cast<int>(state.edges.size()));
+                }
             }
         }
 
