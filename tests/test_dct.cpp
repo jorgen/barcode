@@ -394,6 +394,68 @@ TEST_CASE("estimate_blur_sigma returns ~0 for sharp signal and recovers known si
     }
 }
 
+TEST_CASE("Autocorrelation of constant signal is constant", "[dct][autocorrelation]") {
+    Scanline signal(64, 42.0f);
+    auto autocorr = dct_autocorrelation(signal);
+    REQUIRE(autocorr.size() == 64);
+
+    // A constant signal is perfectly correlated with itself at all lags
+    for (size_t k = 1; k < autocorr.size(); ++k) {
+        REQUIRE_THAT(autocorr[k], WithinAbs(autocorr[0], autocorr[0] * 1e-3f));
+    }
+}
+
+TEST_CASE("Autocorrelation of cosine peaks at multiples of period", "[dct][autocorrelation]") {
+    const int N = 128;
+    const int period = 16; // cosine with period 16 samples
+    Scanline signal(N);
+    for (int i = 0; i < N; ++i) {
+        signal[i] = std::cos(2.0f * std::numbers::pi_v<float> * i / period);
+    }
+
+    auto autocorr = dct_autocorrelation(signal);
+
+    // Normalize
+    float norm = autocorr[0];
+    REQUIRE(norm > 0.0f);
+    for (auto& v : autocorr) v /= norm;
+
+    // autocorrelation should peak near lag=period and lag=2*period
+    // Find first peak after lag 0
+    int first_peak = -1;
+    for (int i = 2; i < N / 2; ++i) {
+        if (autocorr[i] > autocorr[i - 1] && autocorr[i] > autocorr[i + 1] && autocorr[i] > 0.5f) {
+            first_peak = i;
+            break;
+        }
+    }
+    REQUIRE(std::abs(first_peak - period) <= 1);
+}
+
+TEST_CASE("Autocorrelation of square wave peaks at period", "[dct][autocorrelation]") {
+    const int N = 128;
+    const int period = 20;
+    Scanline signal(N);
+    for (int i = 0; i < N; ++i) {
+        signal[i] = (i % period < period / 2) ? 255.0f : 0.0f;
+    }
+
+    auto autocorr = dct_autocorrelation(signal);
+    float norm = autocorr[0];
+    REQUIRE(norm > 0.0f);
+    for (auto& v : autocorr) v /= norm;
+
+    // Find first peak after lag 0
+    int first_peak = -1;
+    for (int i = 2; i < N / 2; ++i) {
+        if (autocorr[i] > autocorr[i - 1] && autocorr[i] > autocorr[i + 1] && autocorr[i] > 0.3f) {
+            first_peak = i;
+            break;
+        }
+    }
+    REQUIRE(std::abs(first_peak - period) <= 2);
+}
+
 TEST_CASE("Power spectrum", "[dct]") {
     Scanline signal(64);
     for (size_t i = 0; i < signal.size(); ++i) {

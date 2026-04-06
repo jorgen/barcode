@@ -194,6 +194,87 @@ TEST_CASE("Auto blur estimation + WienerDeconv recovers EAN-13 decode", "[integr
     REQUIRE(result.text == code);
 }
 
+TEST_CASE("Full pipeline with correlation decode", "[integration][correlation]") {
+    std::string code = "5901234123457";
+    int module_width = 3;
+    int height = 50;
+
+    auto img = make_ean13_image(code, module_width, height);
+    BarcodeRegion region{0, 0, static_cast<float>(img.width), static_cast<float>(img.height), {1.0f, 0.0f}};
+    ExtractionParams params;
+    params.num_scanlines = 1;
+    params.sample_step = 1.0f;
+
+    auto lines = extract_scanlines(img, region, params);
+    REQUIRE(lines.size() == 1);
+
+    auto result = decode_scanline(lines[0], DecodeMethod::Correlation);
+    REQUIRE(result.success);
+    REQUIRE(result.text == code);
+}
+
+TEST_CASE("Correlation decode handles noise that breaks edge detection", "[integration][correlation]") {
+    std::string code = "5901234123457";
+    // Module width 5 with noise — templates are long enough for robust matching
+    auto img = make_ean13_image(code, 5, 50);
+
+    BarcodeRegion region{0, 0, static_cast<float>(img.width), static_cast<float>(img.height), {1.0f, 0.0f}};
+    ExtractionParams params;
+    params.num_scanlines = 1;
+
+    auto lines = extract_scanlines(img, region, params);
+    auto scanline = lines[0];
+
+    // Add noise that is significant relative to module width
+    std::mt19937 rng(123);
+    std::normal_distribution<float> noise(0.0f, 30.0f);
+    for (auto& v : scanline) {
+        v = std::clamp(v + noise(rng), 0.0f, 255.0f);
+    }
+
+    // Wiener filter to clean up noise (preserves signal structure)
+    FilterParams filter;
+    filter.type = FilterType::Wiener;
+    filter.noise_power = 900.0f;
+    auto filtered = dct_filter(scanline, filter);
+
+    // Correlation decode on filtered signal
+    auto result = decode_scanline(filtered, DecodeMethod::Correlation);
+    REQUIRE(result.success);
+    REQUIRE(result.text == code);
+}
+
+TEST_CASE("Noisy scanline with DCT filter + correlation decode", "[integration][correlation][noise]") {
+    std::string code = "5901234123457";
+    // Larger module width tolerates noise better
+    auto img = make_ean13_image(code, 5, 50);
+
+    BarcodeRegion region{0, 0, static_cast<float>(img.width), static_cast<float>(img.height), {1.0f, 0.0f}};
+    ExtractionParams params;
+    params.num_scanlines = 1;
+
+    auto lines = extract_scanlines(img, region, params);
+    auto scanline = lines[0];
+
+    // Add moderate noise
+    std::mt19937 rng(42);
+    std::normal_distribution<float> noise(0.0f, 20.0f);
+    for (auto& v : scanline) {
+        v = std::clamp(v + noise(rng), 0.0f, 255.0f);
+    }
+
+    // Apply Wiener filter (preserves signal structure better than low-pass)
+    FilterParams filter;
+    filter.type = FilterType::Wiener;
+    filter.noise_power = 400.0f; // ~noise_stddev^2
+
+    auto filtered = dct_filter(scanline, filter);
+
+    auto result = decode_scanline(filtered, DecodeMethod::Correlation);
+    REQUIRE(result.success);
+    REQUIRE(result.text == code);
+}
+
 TEST_CASE("Multiple scanline averaging + DCT", "[integration][averaging]") {
     std::string code = "9780201379624";
     auto img = make_ean13_image(code, 3, 50);

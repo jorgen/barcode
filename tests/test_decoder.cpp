@@ -173,3 +173,151 @@ TEST_CASE("Decode fails on garbage data", "[decoder][ean13]") {
     auto result = decode_scanline(noise);
     REQUIRE_FALSE(result.success);
 }
+
+// --- Correlation decoder tests ---
+
+TEST_CASE("Module width estimation on perfect synthetic scanline", "[decoder][module_width]") {
+    std::string code = "5901234123457";
+
+    SECTION("module width 2") {
+        auto scanline = make_perfect_scanline(code, 2.0f);
+        float mw = estimate_module_width(scanline);
+        REQUIRE(mw > 0.0f);
+        REQUIRE(mw > 2.0f * 0.85f);
+        REQUIRE(mw < 2.0f * 1.15f);
+    }
+
+    SECTION("module width 3") {
+        auto scanline = make_perfect_scanline(code, 3.0f);
+        float mw = estimate_module_width(scanline);
+        REQUIRE(mw > 0.0f);
+        REQUIRE(mw > 3.0f * 0.85f);
+        REQUIRE(mw < 3.0f * 1.15f);
+    }
+
+    SECTION("module width 4") {
+        auto scanline = make_perfect_scanline(code, 4.0f);
+        float mw = estimate_module_width(scanline);
+        REQUIRE(mw > 0.0f);
+        REQUIRE(mw > 4.0f * 0.85f);
+        REQUIRE(mw < 4.0f * 1.15f);
+    }
+
+    SECTION("module width 5") {
+        auto scanline = make_perfect_scanline(code, 5.0f);
+        float mw = estimate_module_width(scanline);
+        REQUIRE(mw > 0.0f);
+        REQUIRE(mw > 5.0f * 0.85f);
+        REQUIRE(mw < 5.0f * 1.15f);
+    }
+}
+
+TEST_CASE("Module width estimation on noisy scanline", "[decoder][module_width][noise]") {
+    std::string code = "5901234123457";
+    auto scanline = make_perfect_scanline(code, 3.0f);
+
+    std::mt19937 rng(42);
+    std::normal_distribution<float> noise(0.0f, 20.0f);
+    for (auto& v : scanline) {
+        v = std::clamp(v + noise(rng), 0.0f, 255.0f);
+    }
+
+    float mw = estimate_module_width(scanline);
+    REQUIRE(mw > 0.0f);
+    REQUIRE(mw > 3.0f * 0.80f);
+    REQUIRE(mw < 3.0f * 1.20f);
+}
+
+TEST_CASE("Digit template has correct length", "[decoder][correlation]") {
+    float mw = 3.0f;
+    auto templ = make_digit_template(0, mw, 'L');
+    REQUIRE(static_cast<int>(templ.size()) == static_cast<int>(std::round(7.0f * mw)));
+}
+
+TEST_CASE("L-code template starts with space, R-code starts with bar", "[decoder][correlation]") {
+    float mw = 4.0f;
+    auto l_templ = make_digit_template(0, mw, 'L');
+    auto r_templ = make_digit_template(0, mw, 'R');
+
+    // L-code: first element is space (255)
+    REQUIRE(l_templ[0] == 255.0f);
+    // R-code: first element is bar (0)
+    REQUIRE(r_templ[0] == 0.0f);
+}
+
+TEST_CASE("NCC of identical signals is 1.0", "[decoder][correlation]") {
+    Scanline a = {0, 50, 100, 200, 255, 200, 100, 50};
+    float ncc = normalized_cross_correlation(a, a);
+    REQUIRE_THAT(ncc, WithinAbs(1.0f, 1e-5));
+}
+
+TEST_CASE("Slide correlate finds embedded template", "[decoder][correlation]") {
+    // Create a signal with a template embedded at a known position
+    float mw = 3.0f;
+    auto templ = make_digit_template(5, mw, 'L');
+    int embed_pos = 20;
+
+    Scanline signal(100, 128.0f); // gray background
+    for (size_t i = 0; i < templ.size() && embed_pos + i < signal.size(); ++i) {
+        signal[embed_pos + i] = templ[i];
+    }
+
+    auto match = slide_correlate(signal, templ);
+    REQUIRE(match.correlation > 0.9f);
+    REQUIRE(std::abs(match.position - embed_pos) <= 1);
+}
+
+TEST_CASE("Decode perfect synthetic EAN-13 with correlation", "[decoder][ean13][correlation]") {
+    std::string code = "5901234123457";
+
+    SECTION("module width 3") {
+        auto scanline = make_perfect_scanline(code, 3.0f);
+        auto result = decode_ean13_correlation(scanline);
+        REQUIRE(result.success);
+        REQUIRE(result.text == code);
+    }
+
+    SECTION("module width 4") {
+        auto scanline = make_perfect_scanline(code, 4.0f);
+        auto result = decode_ean13_correlation(scanline);
+        REQUIRE(result.success);
+        REQUIRE(result.text == code);
+    }
+
+    SECTION("module width 5") {
+        auto scanline = make_perfect_scanline(code, 5.0f);
+        auto result = decode_ean13_correlation(scanline);
+        REQUIRE(result.success);
+        REQUIRE(result.text == code);
+    }
+}
+
+TEST_CASE("Correlation decode various EAN-13 codes", "[decoder][ean13][correlation]") {
+    std::vector<std::string> codes = {
+        "4006381333931",
+        "0012345678905",
+        "9780201379624",
+        "8413000065504",
+    };
+
+    for (const auto& code : codes) {
+        CAPTURE(code);
+        auto scanline = make_perfect_scanline(code, 3.0f);
+        auto result = decode_ean13_correlation(scanline);
+        REQUIRE(result.success);
+        REQUIRE(result.text == code);
+    }
+}
+
+TEST_CASE("DecodeMethod dispatch works", "[decoder][correlation]") {
+    std::string code = "5901234123457";
+    auto scanline = make_perfect_scanline(code, 3.0f);
+
+    auto r1 = decode_scanline(scanline, DecodeMethod::EdgeThreshold);
+    REQUIRE(r1.success);
+    REQUIRE(r1.text == code);
+
+    auto r2 = decode_scanline(scanline, DecodeMethod::Correlation);
+    REQUIRE(r2.success);
+    REQUIRE(r2.text == code);
+}
